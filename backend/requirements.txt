@@ -1,0 +1,15 @@
+fastapi
+uvicorn[standard]
+sqlalchemy[asyncio]
+asyncpg
+alembic
+pydantic-settings
+pyjwt
+bcrypt
+email-validator
+
+# dev / test
+pytest
+pytest-asyncio
+aiosqlite
+httpx

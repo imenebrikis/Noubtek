@@ -1,0 +1,13 @@
+# env / secrets
+.env
+.env.*
+!.env.example
+
+# python
+.venv/
+__pycache__/
+*.pyc
+
+# sveltekit / node
+.svelte-kit/
+node_modules/
