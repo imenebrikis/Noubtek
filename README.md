@@ -1,4 +1,4 @@
-# ClinicFlow
+# Noubtek; ClinicFlow
 
 > Eliminating waiting room friction for dental clinics — one queue at a time.
 
@@ -17,7 +17,7 @@
 
 Dental clinics in Algeria run on paper schedules and optimism. A single overrun procedure cascades into an hour of delays, frustrated patients crowding the waiting room, and receptionists fielding complaints instead of doing their job.
 
-ClinicFlow gives clinics a real-time queue engine, an AI layer that predicts how late each doctor is running today (based on their own historical pace), and a patient-facing tracker so people can wait at home instead of in a plastic chair.
+Noubtek gives clinics a real-time queue engine, an AI layer that predicts how late each doctor is running today (based on their own historical pace), and a patient-facing tracker so people can wait at home instead of in a plastic chair.
 
 It's a B2B SaaS — clinics subscribe, their patients use it for free via a personal link sent at booking.
 
