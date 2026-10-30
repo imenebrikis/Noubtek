@@ -40,7 +40,7 @@ async def test_clinic_a_cannot_read_clinic_b_appointments(session):
 
 async def test_receptionist_cannot_change_own_role(client, session):
     # clinic + admin owner via the real register endpoint
-    r = await client.post("/auth/register", json={
+    r = await client.post("/api/v1/auth/register", json={
         "email": "owner@example.com",
         "password": "password123",
         "full_name": "Owner",
@@ -62,7 +62,7 @@ async def test_receptionist_cannot_change_own_role(client, session):
     session.add(recep_member)
     await session.commit()
 
-    login = await client.post("/auth/login", json={
+    login = await client.post("/api/v1/auth/login", json={
         "email": "recep@example.com", "password": "password123",
     })
     assert login.status_code == 200

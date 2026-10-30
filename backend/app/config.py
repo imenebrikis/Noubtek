@@ -14,6 +14,8 @@ class Settings(BaseSettings):
     JWT_ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 15
     REFRESH_TOKEN_EXPIRE_DAYS: int = 30
+    GEMINI_API_KEY: str | None = None  # unset -> delay engine uses heuristic fallback
+    GOOGLE_CLIENT_ID: str | None = None  # unset -> /auth/google returns 501
 
 
 settings = Settings()

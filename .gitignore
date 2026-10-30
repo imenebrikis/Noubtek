@@ -11,3 +11,4 @@ __pycache__/
 # sveltekit / node
 .svelte-kit/
 node_modules/
+

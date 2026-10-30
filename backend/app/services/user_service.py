@@ -46,6 +46,25 @@ class UserService:
             return None
         return user, membership
 
+    async def membership_by_email(self, email: str) -> tuple[User, ClinicMember] | None:
+        """Look up a user + their first membership by email, skipping the password
+        check — used by federated sign-in (Google) where there is no password."""
+        user = (
+            await self.session.execute(select(User).where(User.email == email))
+        ).scalar_one_or_none()
+        if user is None:
+            return None
+        membership = (
+            await self.session.execute(
+                select(ClinicMember)
+                .where(ClinicMember.user_id == user.id)
+                .order_by(ClinicMember.created_at)
+            )
+        ).scalars().first()
+        if membership is None:
+            return None
+        return user, membership
+
     async def get_membership(self, user_id: uuid.UUID, clinic_id: uuid.UUID) -> ClinicMember | None:
         return (
             await self.session.execute(

@@ -9,7 +9,7 @@ from sqlalchemy import Select, select
 from app.models import ClinicRole
 from app.services.auth_service import AuthService
 
-oauth2 = OAuth2PasswordBearer(tokenUrl="/auth/login")
+oauth2 = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login")
 
 
 @dataclass

@@ -107,6 +107,7 @@ class Appointment(Base):
     scheduled_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     scheduled_duration_minutes: Mapped[int] = mapped_column(Integer, default=30)
     predicted_start: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))  # written by heuristic engine
+    source: Mapped[str] = mapped_column(String(16), default="walk_in", server_default="scheduled")  # 'walk_in' | 'scheduled' — for BI bookings-vs-walkins
 
     status: Mapped[AppointmentStatus] = mapped_column(
         SAEnum(AppointmentStatus, name="appointment_status"),
