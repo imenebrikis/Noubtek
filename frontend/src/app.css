@@ -1,0 +1,10 @@
+@import 'tailwindcss';
+
+/* ponytail: minimal healthcare theme — neutral slate bg, calm teal accent */
+:root {
+	color-scheme: light;
+}
+html {
+	background: #f8fafc; /* slate-50 */
+	font-family: 'Poppins', ui-sans-serif, system-ui, -apple-system, sans-serif;
+}
