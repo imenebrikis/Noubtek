@@ -2,18 +2,23 @@
 import uuid
 from datetime import date as date_cls, datetime, time, timedelta, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status as http
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status as http
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_session
 from app.dependencies import TenantContext, require_role, scoped
+from app.localtime import day_bounds, hhmm, local_at, parse_local, to_local, today
 from app.models import (
-    Appointment, AppointmentStatus, Clinic, ClinicMember, ClinicRole, Patient, ProcedureType,
+    PROCEDURE_MINUTES, Appointment, AppointmentStatus, Clinic, ClinicMember, ClinicRole, Patient,
+    ProcedureCategory, ProcedureType, is_slot_conflict,
 )
 from app.routers.queue import DelayAlert, QueueItemOut, build_queue_response
+from app.services.ai_delay import delay_insight, estimate_queue
 from app.services.appointment_service import AppointmentService
+from app.services.patient_alerts import alert_message, apply_alerts, pending_alerts, send_alert_sms
 
 router = APIRouter(tags=["appointments"])
 
@@ -26,18 +31,34 @@ _LIVE = (AppointmentStatus.scheduled, AppointmentStatus.waiting,
 
 
 # --- GET /api/v1/public/track/{tracking_token} (patient live tracker) --------
+class TrackAlertOut(BaseModel):
+    message: str           # French, ready to display
+    shift_minutes: int     # > 0 later, < 0 earlier than previously announced
+    at: str                # HH:MM the alert was raised
+    source: str            # 'gemini' | 'heuristic'
+
+
 class PublicTrackOut(BaseModel):
     clinic_name: str
+    doctor_id: uuid.UUID | None  # public booking key (same id as /book?doctor=…) — for re-booking
     patient_first_name: str
     status: AppointmentStatus
     position: int        # 1-based rank among waiting; 0 = in session; -1 = done/other
     people_ahead: int
     eta_minutes: int
-    consult_time: str | None  # HH:MM (predicted if known, else scheduled)
+    consult_time: str | None  # HH:MM (live prediction while waiting, else scheduled)
+    delay_minutes: int        # doctor's current lateness (local heuristic)
+    ai_message: str           # French message for patients (Gemini, or default text)
+    ai_source: str            # 'gemini' | 'heuristic'
+    alert: TrackAlertOut | None = None  # proactive alert while waiting
+    latest_message: str | None = None   # last staff broadcast (dashboard "SMS de retard"), while waiting
+    latest_message_at: datetime | None = None  # clinic-local; changes on every new broadcast
 
 
 @router.get("/api/v1/public/track/{tracking_token}", response_model=PublicTrackOut)
-async def track(tracking_token: uuid.UUID, session: AsyncSession = Depends(get_session)):
+async def track(
+    tracking_token: uuid.UUID, background: BackgroundTasks, session: AsyncSession = Depends(get_session),
+):
     appt = (
         await session.execute(select(Appointment).where(Appointment.tracking_token == tracking_token))
     ).scalar_one_or_none()
@@ -46,46 +67,81 @@ async def track(tracking_token: uuid.UUID, session: AsyncSession = Depends(get_s
 
     clinic = (await session.execute(select(Clinic).where(Clinic.id == appt.clinic_id))).scalar_one()
     patient = (await session.execute(select(Patient).where(Patient.id == appt.patient_id))).scalar_one()
+    doctor = (
+        await session.execute(select(ClinicMember).where(
+            ClinicMember.clinic_id == appt.clinic_id, ClinicMember.id == appt.doctor_member_id,
+        ))
+    ).scalar_one_or_none()
 
-    # rank among this doctor's waiting queue today (same ordering as the staff board)
-    day = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-    waiting_ids = (
+    # this doctor's whole day: the estimator needs the in-session row (overrun) + the waiting line
+    day_start, day_end = day_bounds(today())
+    day_appts = (
         await session.execute(
-            select(Appointment.id)
-            .where(
+            select(Appointment).where(
                 Appointment.clinic_id == appt.clinic_id,
-                Appointment.doctor_member_id == appt.doctor_member_id,
-                Appointment.status == AppointmentStatus.waiting,
-                Appointment.scheduled_start >= day,
-                Appointment.scheduled_start < day + timedelta(days=1),
+                Appointment.doctor_member_id.is_not_distinct_from(appt.doctor_member_id),
+                Appointment.scheduled_start >= day_start,
+                Appointment.scheduled_start < day_end,
             )
-            .order_by(func.coalesce(Appointment.arrived_at, Appointment.scheduled_start))
         )
     ).scalars().all()
 
-    if appt.status is AppointmentStatus.waiting and appt.id in waiting_ids:
-        position = waiting_ids.index(appt.id) + 1
-        people_ahead = position - 1
-    elif appt.status is AppointmentStatus.in_session:
-        position, people_ahead = 0, 0
-    else:
-        position, people_ahead = -1, 0
-
     now = datetime.now(timezone.utc)
-    if appt.predicted_start:
-        eta = max(0, round((appt.predicted_start - now).total_seconds() / 60))
+    est = estimate_queue(day_appts, now)
+    # polls also catch drift with no staff action (e.g. a session overrunning)
+    # ponytail: write on GET; move to a periodic job once we have a scheduler
+    fired = apply_alerts(day_appts, est, now)
+    await session.commit()
+    if fired:
+        contacts = {
+            pid: (name, phone) for pid, name, phone in (await session.execute(
+                select(Patient.id, Patient.full_name, Patient.phone).where(
+                    Patient.clinic_id == appt.clinic_id, Patient.id.in_([a.patient_id for a in fired]),
+                )
+            )).all()
+        }
+        background.add_task(send_alert_sms, pending_alerts(fired, contacts))
+    insight = await delay_insight(
+        (appt.clinic_id, appt.doctor_member_id), est, (doctor and doctor.display_name) or "Votre médecin",
+    )
+
+    predicted = est.predicted.get(appt.id)
+    if predicted is not None:
+        position = sorted(est.predicted, key=est.predicted.get).index(appt.id) + 1
+        people_ahead = position - 1
+        eta = max(0, round((predicted - now).total_seconds() / 60))
+    elif appt.status is AppointmentStatus.in_session:
+        position, people_ahead, eta = 0, 0, 0
     else:
-        eta = people_ahead * 15  # ponytail: same per-patient pacing as the delay heuristic
-    consult_dt = appt.predicted_start or appt.scheduled_start
+        position, people_ahead, eta = -1, 0, 0
+    consult_dt = predicted or appt.scheduled_start
+
+    alert = None
+    if predicted is not None and appt.alert_at and appt.alert_shift_minutes:
+        text = await alert_message(appt.alert_shift_minutes, appt.notified_start)
+        alert = TrackAlertOut(
+            message=text.message, shift_minutes=appt.alert_shift_minutes,
+            at=hhmm(appt.alert_at), source=text.source,
+        )
+
+    # a delay broadcast only matters while they're still in the line
+    show_message = bool(appt.status is AppointmentStatus.waiting and appt.latest_message and appt.latest_message_at)
 
     return PublicTrackOut(
         clinic_name=clinic.name,
+        doctor_id=appt.doctor_member_id,
         patient_first_name=patient.full_name.split(" ")[0],
         status=appt.status,
         position=position,
         people_ahead=people_ahead,
         eta_minutes=eta,
-        consult_time=consult_dt.astimezone(timezone.utc).strftime("%H:%M"),
+        consult_time=hhmm(consult_dt),
+        delay_minutes=est.delay_minutes,
+        ai_message=insight.apology_message,
+        ai_source=insight.source,
+        alert=alert,
+        latest_message=appt.latest_message if show_message else None,
+        latest_message_at=to_local(appt.latest_message_at) if show_message else None,
     )
 
 
@@ -98,9 +154,28 @@ def _all_slots() -> list[str]:
     return out
 
 
+async def taken_slots(session: AsyncSession, doctor: ClinicMember, day: date_cls) -> set[str]:
+    """Clinic-local "HH:MM" starts already held on `day` for this doctor."""
+    start, end = day_bounds(day)
+    booked = (
+        await session.execute(
+            select(Appointment.scheduled_start).where(
+                Appointment.clinic_id == doctor.clinic_id,
+                Appointment.doctor_member_id == doctor.id,
+                Appointment.scheduled_start >= start,
+                Appointment.scheduled_start < end,
+                Appointment.status.in_(_LIVE),
+            )
+        )
+    ).scalars().all()
+    return {hhmm(s) for s in booked}
+
+
 # --- GET /api/v1/public/slots ------------------------------------------------
 class SlotsOut(BaseModel):
     doctor_id: uuid.UUID
+    doctor_name: str | None   # public profile for the booking page header
+    specialty: str | None
     date: date_cls
     slot_minutes: int
     free_slots: list[str]
@@ -114,26 +189,17 @@ async def free_slots(
 ):
     # public endpoint: derive clinic_id from the doctor so tenancy still holds
     doctor = (
-        await session.execute(select(ClinicMember).where(ClinicMember.id == doctor_id))
+        await session.execute(select(ClinicMember).where(
+            ClinicMember.id == doctor_id, ClinicMember.role == ClinicRole.doctor,
+        ))
     ).scalar_one_or_none()
     if doctor is None:
         raise HTTPException(http.HTTP_404_NOT_FOUND, "Doctor not found")
 
-    day = datetime(date.year, date.month, date.day, tzinfo=timezone.utc)
-    booked = (
-        await session.execute(
-            select(Appointment.scheduled_start).where(
-                Appointment.clinic_id == doctor.clinic_id,
-                Appointment.doctor_member_id == doctor_id,
-                Appointment.scheduled_start >= day,
-                Appointment.scheduled_start < day + timedelta(days=1),
-                Appointment.status.in_(_LIVE),
-            )
-        )
-    ).scalars().all()
-    taken = {s.astimezone(timezone.utc).strftime("%H:%M") for s in booked}
+    taken = await taken_slots(session, doctor, date)
     return SlotsOut(
-        doctor_id=doctor_id, date=date, slot_minutes=SLOT_MINUTES,
+        doctor_id=doctor_id, doctor_name=doctor.display_name, specialty=doctor.specialty,
+        date=date, slot_minutes=SLOT_MINUTES,
         free_slots=[s for s in _all_slots() if s not in taken],
     )
 
@@ -142,7 +208,8 @@ async def free_slots(
 class WalkInIn(BaseModel):
     full_name: str = Field(min_length=1)
     phone: str | None = None
-    procedure_type: str | None = None
+    procedure_type: str | None = None   # free-text name, clinic's own catalogue
+    procedure_category: ProcedureCategory = ProcedureCategory.routine  # drives the wait estimate
     doctor_id: uuid.UUID
     is_scheduled: bool = False
     slot_time: str | None = None  # "HH:MM" (today) or full ISO datetime; required if is_scheduled
@@ -164,18 +231,18 @@ class WalkInResponse(BaseModel):
 
 
 def _parse_slot(slot_time: str) -> datetime:
+    """"HH:MM" (clinic-local, today) or ISO datetime (naive = clinic-local) -> UTC."""
     try:
-        dt = datetime.fromisoformat(slot_time)
+        return parse_local(datetime.fromisoformat(slot_time))
     except ValueError:
         hh, mm = (int(x) for x in slot_time.split(":"))
-        today = datetime.now(timezone.utc)
-        dt = today.replace(hour=hh, minute=mm, second=0, microsecond=0)
-    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+        return local_at(today(), time(hh, mm))
 
 
 @router.post("/api/v1/queue/walk-in", response_model=WalkInResponse, status_code=http.HTTP_201_CREATED)
 async def register_walk_in(
     body: WalkInIn,
+    background: BackgroundTasks,
     ctx: TenantContext = Depends(require_role(ClinicRole.admin, ClinicRole.receptionist)),
     session: AsyncSession = Depends(get_session),
 ):
@@ -187,7 +254,7 @@ async def register_walk_in(
         raise HTTPException(http.HTTP_404_NOT_FOUND, "Doctor not found in this clinic")
 
     if body.is_scheduled and not body.slot_time:
-        raise HTTPException(http.HTTP_422_UNPROCESSABLE_ENTITY, "slot_time required when is_scheduled")
+        raise HTTPException(http.HTTP_422_UNPROCESSABLE_CONTENT, "slot_time required when is_scheduled")
 
     # find-or-create Patient by phone (within clinic)
     patient = None
@@ -200,8 +267,8 @@ async def register_walk_in(
         session.add(patient)
         await session.flush()
 
-    # find-or-create ProcedureType by name (optional)
-    duration, procedure_id = SLOT_MINUTES, None
+    # expected chair time comes from the category; ProcedureType is just the clinic's label
+    duration, procedure_id = PROCEDURE_MINUTES[body.procedure_category], None
     if body.procedure_type:
         proc = (
             await session.execute(
@@ -211,11 +278,11 @@ async def register_walk_in(
         if proc is None:
             proc = ProcedureType(
                 clinic_id=ctx.clinic_id, name=body.procedure_type,
-                default_duration_minutes=SLOT_MINUTES,
+                default_duration_minutes=duration,
             )
             session.add(proc)
             await session.flush()
-        procedure_id, duration = proc.id, proc.default_duration_minutes
+        procedure_id = proc.id
 
     scheduled_start = _parse_slot(body.slot_time) if body.is_scheduled else datetime.now(timezone.utc)
 
@@ -224,13 +291,20 @@ async def register_walk_in(
         patient_id=patient.id,
         doctor_member_id=body.doctor_id,
         procedure_type_id=procedure_id,
+        procedure_category=body.procedure_category,
         scheduled_start=scheduled_start,
         scheduled_duration_minutes=duration,
         source="scheduled" if body.is_scheduled else "walk_in",
         # status defaults to 'scheduled'; tracking_token auto-generated (uuid4)
     )
     session.add(appt)
-    await session.flush()  # assign id before the transition reads it
+    try:
+        await session.flush()  # assign id before the transition reads it
+    except IntegrityError as exc:
+        await session.rollback()
+        if is_slot_conflict(exc):  # scheduled slot already held for this doctor
+            raise HTTPException(http.HTTP_409_CONFLICT, "Ce créneau est déjà pris pour ce médecin.") from exc
+        raise
 
     # route the intake event through the ONE writer of appointment_events
     appt = await AppointmentService(session).transition(ctx, appt.id, AppointmentStatus.waiting)
@@ -239,5 +313,5 @@ async def register_walk_in(
         status=appt.status, source=appt.source, scheduled_start=appt.scheduled_start,
     )
     # recalculate delay for this doctor and return the refreshed board + alert
-    board = await build_queue_response(ctx, session, body.doctor_id)
+    board = await build_queue_response(ctx, session, body.doctor_id, background)
     return WalkInResponse(created=created, queue=board.queue, delay_alert=board.delay_alert)

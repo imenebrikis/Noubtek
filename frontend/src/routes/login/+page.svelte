@@ -2,21 +2,23 @@
 	import { onMount } from 'svelte';
 	import { goto } from '$app/navigation';
 
-	declare global {
-		interface Window {
-			google?: any;
-		}
-	}
-
 	const TOKEN_KEY = 'noubtek_token';
-	// paste your real Client ID in frontend/.env as VITE_GOOGLE_CLIENT_ID=...
+	// Google sign-in is opt-in: set VITE_GOOGLE_LOGIN=on in frontend/.env once the client ID
+	// lists this site under "Authorized JavaScript origins" — until then it would be a dead button
 	const GOOGLE_CLIENT_ID =
-		(import.meta.env.VITE_GOOGLE_CLIENT_ID as string | undefined) ??
-		'YOUR_GOOGLE_CLIENT_ID.apps.googleusercontent.com';
+		import.meta.env.VITE_GOOGLE_LOGIN === 'on'
+			? ((import.meta.env.VITE_GOOGLE_CLIENT_ID as string | undefined)?.trim() ?? '')
+			: '';
 
 	let mode = $state<'login' | 'signup'>('login');
 	let email = $state('');
 	let password = $state('');
+	let showPassword = $state(false);
+
+	function forgotPassword(e: MouseEvent) {
+		e.preventDefault(); // ponytail: no reset flow yet — v2.0
+		alert('La réinitialisation du mot de passe sera disponible dans la version 2.0 !');
+	}
 	let error = $state('');
 	let loading = $state(false);
 	let googleBtnHost = $state<HTMLDivElement>();
@@ -27,6 +29,7 @@
 			goto('/dashboard');
 			return;
 		}
+		if (!GOOGLE_CLIENT_ID) return;
 		// load Google Identity Services, then render the real (popup-flow) button
 		const s = document.createElement('script');
 		s.src = 'https://accounts.google.com/gsi/client';
@@ -153,20 +156,49 @@
 			</div>
 			<div>
 				<label class="text-xs font-medium text-slate-500" for="password">Mot de passe</label>
-				<input
-					id="password"
-					type="password"
-					bind:value={password}
-					autocomplete={mode === 'login' ? 'current-password' : 'new-password'}
-					placeholder="••••••••"
-					class="mt-1 min-h-[44px] w-full rounded-xl border border-slate-200 bg-slate-50 px-4 text-sm focus:border-indigo-400 focus:bg-white focus:outline-none focus:ring-2 focus:ring-indigo-100"
-				/>
+				<div class="relative mt-1">
+					<input
+						id="password"
+						type={showPassword ? 'text' : 'password'}
+						bind:value={password}
+						autocomplete={mode === 'login' ? 'current-password' : 'new-password'}
+						placeholder="••••••••"
+						class="min-h-[44px] w-full rounded-xl border border-slate-200 bg-slate-50 pl-4 pr-12 text-sm focus:border-indigo-400 focus:bg-white focus:outline-none focus:ring-2 focus:ring-indigo-100"
+					/>
+					<button
+						type="button"
+						onclick={() => (showPassword = !showPassword)}
+						aria-label={showPassword ? 'Masquer le mot de passe' : 'Afficher le mot de passe'}
+						aria-pressed={showPassword}
+						class="absolute inset-y-0 right-0 flex w-11 items-center justify-center rounded-r-xl text-slate-400 transition hover:text-slate-600 focus:outline-none focus-visible:text-indigo-600"
+					>
+						<svg class="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+							{#if showPassword}
+								<path d="M10.733 5.076a10.744 10.744 0 0 1 11.205 6.575 1 1 0 0 1 0 .696 10.747 10.747 0 0 1-1.444 2.49" />
+								<path d="M14.084 14.158a3 3 0 0 1-4.242-4.242" />
+								<path d="M17.479 17.499a10.75 10.75 0 0 1-15.417-5.151 1 1 0 0 1 0-.696 10.75 10.75 0 0 1 4.446-5.143" />
+								<path d="m2 2 20 20" />
+							{:else}
+								<path d="M2.062 12.348a1 1 0 0 1 0-.696 10.75 10.75 0 0 1 19.876 0 1 1 0 0 1 0 .696 10.75 10.75 0 0 1-19.876 0" />
+								<path d="M15 12a3 3 0 1 1-6 0 3 3 0 0 1 6 0" />
+							{/if}
+						</svg>
+					</button>
+				</div>
+				{#if mode === 'login'}
+					<div class="mt-2 text-right">
+						<a href="#mot-de-passe-oublie" onclick={forgotPassword} class="text-xs font-medium text-indigo-600 hover:text-indigo-700 hover:underline">
+							Mot de passe oublié ?
+						</a>
+					</div>
+				{/if}
 			</div>
 			{#if error}<p class="text-xs text-rose-500">{error}</p>{/if}
 			<!-- hidden submit so Enter works; visible submit is the fixed peach pill below -->
 			<button type="submit" class="hidden" aria-hidden="true"></button>
 		</form>
 
+		{#if GOOGLE_CLIENT_ID}
 		<div class="my-4 flex items-center gap-3 text-xs text-slate-400">
 			<span class="h-px flex-1 bg-slate-200"></span>ou<span class="h-px flex-1 bg-slate-200"></span>
 		</div>
@@ -180,6 +212,7 @@
 			<!-- real Google button (popup flow), transparent, overlaid to catch the click -->
 			<div bind:this={googleBtnHost} class="absolute inset-0 z-10 flex items-center justify-center overflow-hidden opacity-[0.001]"></div>
 		</div>
+		{/if}
 	</div>
 
 	<!-- Fixed bottom peach pill submit -->

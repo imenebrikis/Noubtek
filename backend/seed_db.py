@@ -15,9 +15,10 @@ from sqlalchemy import delete, select
 
 from app.db import SessionLocal
 from app.models import (
-    Appointment, AppointmentEvent, AppointmentStatus, Clinic, ClinicMember,
-    ClinicRole, Patient, User,
+    PROCEDURE_MINUTES, Appointment, AppointmentEvent, AppointmentStatus, Clinic, ClinicMember,
+    ClinicRole, Patient, ProcedureCategory, User,
 )
+from app.services.ai_delay import estimate_queue
 from app.services.auth_service import AuthService
 
 CLINIC_NAME = "Noubtek — Clinique Médicale"
@@ -25,14 +26,21 @@ ADMIN_EMAIL = "judge@noubtek.dz"
 ADMIN_PASSWORD = "admin123"
 DOCTOR_EMAIL = "amine@noubtek.dz"
 
-# (full_name, phone, scheduled offset from 9h, final status)
+# (full_name, phone, booked / session-start minutes relative to NOW, final status, category)
+# Relative to now so the demo reads right whenever it's seeded: Karim's complex act has
+# ~7 min left, so Lina (booked 30 min ago) is seen ~37 min late, then routine, then complex.
+# ponytail: seeding within ~1h30 after midnight (clinic time) pushes the first rows into "yesterday"
 PATIENTS = [
-    ("Yasmine Bouaziz", "+213 555 01 02 03", 0, AppointmentStatus.completed),
-    ("Karim Hadj",      "+213 555 04 05 06", 1, AppointmentStatus.in_session),
-    ("Lina Saïdi",      "+213 555 07 08 09", 2, AppointmentStatus.waiting),
-    ("Omar Belkacem",   "+213 555 10 11 12", 3, AppointmentStatus.waiting),
-    ("Sofia Meziane",   "+213 555 13 14 15", 4, AppointmentStatus.waiting),
+    ("Yasmine Bouaziz", "+213 555 01 02 03", -90, -87, AppointmentStatus.completed,  ProcedureCategory.routine),
+    ("Karim Hadj",      "+213 555 04 05 06", -60, -38, AppointmentStatus.in_session, ProcedureCategory.procedure_complex),
+    ("Lina Saïdi",      "+213 555 07 08 09", -30, None, AppointmentStatus.waiting,   ProcedureCategory.extended),
+    ("Omar Belkacem",   "+213 555 10 11 12", -10, None, AppointmentStatus.waiting,   ProcedureCategory.routine),
+    ("Sofia Meziane",   "+213 555 13 14 15", 15, None, AppointmentStatus.waiting,    ProcedureCategory.procedure_complex),
 ]
+
+# accuracy feedback loop: how many minutes later than first announced the already-seen
+# patients actually went in (> 0 = late). Gives the dashboard's precision line real numbers.
+FIRST_ETA_ERROR_MIN = {"Yasmine Bouaziz": 4, "Karim Hadj": 9}
 
 # which actual timestamps each final status implies, and the transition chain
 _CHAINS = {
@@ -84,29 +92,34 @@ async def seed() -> None:
 
         # --- appointments (today) + their event logs ------------------------
         now = datetime.now(timezone.utc)
-        day_start = now.replace(hour=9, minute=0, second=0, microsecond=0)
+        appts = []
 
-        for full_name, phone, offset, final in PATIENTS:
+        for full_name, phone, booked_min, started_min, final, category in PATIENTS:
             patient = Patient(clinic_id=clinic.id, full_name=full_name, phone=phone)
             s.add(patient)
             await s.flush()
 
-            scheduled = day_start + timedelta(minutes=30 * offset)
+            scheduled = now + timedelta(minutes=booked_min)
             appt = Appointment(
                 clinic_id=clinic.id,
                 patient_id=patient.id,
                 doctor_member_id=doctor_member.id,
                 scheduled_start=scheduled,
+                scheduled_duration_minutes=PROCEDURE_MINUTES[category],
+                procedure_category=category,
                 status=final,
             )
             # stamp actual timestamps to match the final status
             chain = _CHAINS[final]
             if AppointmentStatus.waiting in chain:
-                appt.arrived_at = scheduled
+                appt.arrived_at = min(now, scheduled - timedelta(minutes=2))
             if AppointmentStatus.in_session in chain:
-                appt.session_started_at = scheduled + timedelta(minutes=5)
+                appt.session_started_at = now + timedelta(minutes=started_min)
             if AppointmentStatus.completed in chain:
-                appt.completed_at = scheduled + timedelta(minutes=25)
+                appt.completed_at = appt.session_started_at + timedelta(minutes=PROCEDURE_MINUTES[category] + 3)
+            if full_name in FIRST_ETA_ERROR_MIN:
+                appt.first_predicted_start = appt.session_started_at - timedelta(minutes=FIRST_ETA_ERROR_MIN[full_name])
+            appts.append(appt)
             s.add(appt)
             await s.flush()
 
@@ -119,12 +132,18 @@ async def seed() -> None:
                 ))
                 prev = to
 
+        # waiting patients get the ETA the live engine would have announced
+        for appt_id, start in estimate_queue(appts, now).predicted.items():
+            appt = next(a for a in appts if a.id == appt_id)
+            appt.predicted_start = appt.first_predicted_start = start
+
         await s.commit()
 
     print(f"Seeded clinic '{CLINIC_NAME}'")
     print(f"  admin:  {ADMIN_EMAIL} / {ADMIN_PASSWORD}")
     print(f"  doctor: Dr. Amine — Généraliste")
     print(f"  appointments: 1 terminé, 1 en consultation, 3 en attente")
+    print(f"  catégories: routine ×2, étendue ×1, acte complexe ×2")
 
 
 if __name__ == "__main__":

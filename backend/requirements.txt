@@ -9,9 +9,10 @@ bcrypt
 email-validator
 google-auth
 requests  # transport for google-auth token verification
+httpx     # Gemini REST calls (app.services.ai_delay)
+tzdata    # IANA zones for zoneinfo (Windows ships none) — clinic-local times
 
 # dev / test
 pytest
 pytest-asyncio
 aiosqlite
-httpx

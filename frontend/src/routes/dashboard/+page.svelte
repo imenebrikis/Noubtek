@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { goto } from '$app/navigation';
+	import { page } from '$app/state';
 
 	const TOKEN_KEY = 'noubtek_token';
 
@@ -12,6 +13,8 @@
 		scheduled_start: string;
 		predicted_start: string | null;
 		status: Status;
+		alert_shift_minutes: number | null; // proactive alert sent to the patient: > 0 later, < 0 earlier
+		alert_at: string | null;
 	};
 	type Doctor = { id: string; display_name: string | null; specialty: string | null };
 	type DelayAlert = { estimated_delay_minutes: number; apology_message: string; source: string };
@@ -22,6 +25,11 @@
 	let doctors = $state<Doctor[]>([]);
 	let selectedDoctorId = $state('');
 	let delayAlert = $state<DelayAlert | null>(null);
+	// accuracy feedback loop: first ETA announced vs actual start, today
+	type Accuracy = { sample_size: number; mae_minutes: number | null; bias_minutes: number | null; within_10_min_pct: number | null };
+	let accuracy = $state<Accuracy | null>(null);
+	// non-blocking: the board works even if this call fails
+	const loadAccuracy = () => api('/api/v1/queue/accuracy').then((a) => (accuracy = a)).catch(() => {});
 	let loading = $state(true);
 	let busy = $state(false);
 	let error = $state('');
@@ -72,6 +80,7 @@
 			doctors = docs;
 			if (docs.length) selectedDoctorId = docs[0].id;
 			queue = q;
+			loadAccuracy();
 		} catch (e) {
 			const msg = e instanceof Error ? e.message : String(e);
 			if (msg.startsWith('401')) {
@@ -84,6 +93,16 @@
 		}
 	}
 	onMount(boot);
+
+	// ETAs drift with no click (overruns) and patient alerts fire server-side: refresh quietly
+	$effect(() => {
+		const t = setInterval(() => {
+			if (!token || busy) return; // don't clobber an optimistic move in flight
+			api('/api/v1/queue').then((q) => (queue = q)).catch(() => {});
+			loadAccuracy();
+		}, 30000);
+		return () => clearInterval(t);
+	});
 
 	// --- reactive metrics (full queue) ----------------------------------------
 	const waiting = $derived(queue.filter((r) => r.status === 'waiting'));
@@ -122,6 +141,7 @@
 			// silent sync to DB truth (predicted_start, Gemini delay alert, ordering)
 			queue = res.queue;
 			delayAlert = res.delay_alert;
+			loadAccuracy();
 		} catch (e) {
 			r.status = prev; // revert the optimistic move on failure
 			error = e instanceof Error ? e.message : String(e);
@@ -133,9 +153,18 @@
 
 	// --- walk-in modal --------------------------------------------------------
 	let showModal = $state(false);
-	let form = $state({ full_name: '', phone: '', procedure_type: '', is_scheduled: false, slot_time: '' });
-	const resetForm = () =>
-		(form = { full_name: '', phone: '', procedure_type: '', is_scheduled: false, slot_time: '' });
+	// mirrors backend ProcedureCategory / PROCEDURE_MINUTES (drives the wait estimate)
+	const CATEGORIES = [
+		{ value: 'routine', label: 'Consultation de routine · 15 min' },
+		{ value: 'extended', label: 'Consultation étendue · 20 min' },
+		{ value: 'procedure_minor', label: 'Acte médical court · 30 min' },
+		{ value: 'procedure_complex', label: 'Acte médical complexe · 45 min' }
+	];
+	const emptyForm = () => ({
+		full_name: '', phone: '', procedure_type: '', procedure_category: 'routine', is_scheduled: false, slot_time: ''
+	});
+	let form = $state(emptyForm());
+	const resetForm = () => (form = emptyForm());
 
 	async function submitWalkIn(e: Event) {
 		e.preventDefault();
@@ -148,6 +177,7 @@
 					full_name: form.full_name,
 					phone: form.phone || null,
 					procedure_type: form.procedure_type || null,
+					procedure_category: form.procedure_category,
 					doctor_id: selectedDoctorId,
 					is_scheduled: form.is_scheduled,
 					slot_time: form.is_scheduled ? form.slot_time : null
@@ -155,6 +185,7 @@
 			});
 			queue = res.queue;
 			delayAlert = res.delay_alert;
+			loadAccuracy();
 			showModal = false;
 			resetForm();
 		} catch (err) {
@@ -165,7 +196,10 @@
 	}
 
 	// --- presentation helpers -------------------------------------------------
-	const hhmm = (iso: string) => iso.slice(11, 16);
+	// API sends UTC; show the clinic's wall clock (must match backend CLINIC_TIMEZONE)
+	const CLINIC_TZ = 'Africa/Algiers';
+	const hhmm = (iso: string) =>
+		new Date(iso).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit', timeZone: CLINIC_TZ });
 	const rowTime = (r: Row) => hhmm(r.predicted_start ?? r.scheduled_start);
 	const initials = (name: string) =>
 		name.split(' ').map((p) => p[0]).slice(0, 2).join('').toUpperCase();
@@ -186,15 +220,32 @@
 		completed: 'Terminé'
 	};
 
+	// sidebar: only destinations that exist — in-page anchors on the metrics and the board
 	const NAV = [
-		{ label: "Aujourd'hui", icon: '<path stroke-linecap="round" stroke-linejoin="round" d="M3 10l9-7 9 7v9a2 2 0 01-2 2h-3v-6H8v6H5a2 2 0 01-2-2z"/>', active: true },
-		{ label: 'File en direct', icon: '<path stroke-linecap="round" stroke-linejoin="round" d="M3 12h4l2 6 4-14 2 8h6"/>' },
-		{ label: 'Rendez-vous', icon: '<rect x="3" y="4" width="18" height="17" rx="2"/><path stroke-linecap="round" d="M3 9h18M8 2v4M16 2v4"/>' },
-		{ label: 'Patients', icon: '<path stroke-linecap="round" stroke-linejoin="round" d="M17 20v-2a4 4 0 00-4-4H7a4 4 0 00-4 4v2"/><circle cx="10" cy="7" r="4"/>' },
-		{ label: 'Médecins', icon: '<circle cx="12" cy="8" r="4"/><path stroke-linecap="round" stroke-linejoin="round" d="M4 21v-1a6 6 0 0112 0v1"/>' },
-		{ label: 'Rapports', icon: '<path stroke-linecap="round" stroke-linejoin="round" d="M4 20V10M10 20V4M16 20v-7M2 20h20"/>' },
-		{ label: 'Paramètres', icon: '<circle cx="12" cy="12" r="3"/><path stroke-linecap="round" stroke-linejoin="round" d="M12 2v3M12 19v3M4.2 4.2l2.1 2.1M17.7 17.7l2.1 2.1M2 12h3M19 12h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1"/>' }
+		{ label: "Aujourd'hui", target: 'apercu', icon: '<path stroke-linecap="round" stroke-linejoin="round" d="M3 10l9-7 9 7v9a2 2 0 01-2 2h-3v-6H8v6H5a2 2 0 01-2-2z"/>' },
+		{ label: 'File en direct', target: 'file', icon: '<path stroke-linecap="round" stroke-linejoin="round" d="M3 12h4l2 6 4-14 2 8h6"/>' }
 	];
+	const activeTarget = $derived(page.url.hash.slice(1) || NAV[0].target);
+
+	// "Envoyer SMS de retard": texts the selected doctor's waiting line the current delay message
+	let notifyBusy = $state(false);
+	let notifyResult = $state('');
+	async function notifyDelay() {
+		if (notifyBusy || !selectedDoctorId) return;
+		notifyBusy = true;
+		notifyResult = '';
+		try {
+			const r = await api('/api/v1/queue/notify-delay', { method: 'POST', body: { doctor_id: selectedDoctorId } });
+			const s = (n: number) => (n > 1 ? 's' : '');
+			notifyResult = r.on_screen
+				? `Message affiché chez ${r.on_screen} patient${s(r.on_screen)} · ${r.sent} SMS envoyé${s(r.sent)}.`
+				: 'Aucun patient en attente.';
+		} catch (e) {
+			notifyResult = "Échec de l'envoi, réessayez.";
+		} finally {
+			notifyBusy = false;
+		}
+	}
 
 	const COLUMNS = $derived([
 		{ label: 'En Attente', list: waitingV, dot: 'bg-orange-400' },
@@ -223,8 +274,9 @@
 		</div>
 
 		<nav class="mt-5 flex flex-1 flex-col gap-1">
-			{#each NAV as item}
-				<a href="#{item.label}" class="flex min-h-[44px] items-center gap-3 rounded-lg px-3 text-sm font-medium transition {item.active ? 'bg-indigo-50 text-indigo-700' : 'text-slate-500 hover:bg-slate-50 hover:text-slate-800'}">
+			{#each NAV as item (item.target)}
+				{@const active = activeTarget === item.target}
+				<a href="#{item.target}" aria-current={active ? 'location' : undefined} class="flex min-h-[44px] items-center gap-3 rounded-lg px-3 text-sm font-medium transition {active ? 'bg-indigo-50 text-indigo-700' : 'text-slate-500 hover:bg-slate-50 hover:text-slate-800'}">
 					<svg class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.8">{@html item.icon}</svg>
 					{item.label}
 				</a>
@@ -233,8 +285,17 @@
 
 		<div class="mt-4 rounded-xl bg-[#1f2a52] p-4 text-white">
 			<p class="text-sm font-semibold">En retard aujourd'hui ?</p>
-			<p class="mt-1 text-xs text-indigo-200">Prévenez les {waiting.length} patients en attente en un seul clic.</p>
-			<button class="mt-3 min-h-[44px] w-full rounded-lg bg-white px-3 text-sm font-semibold text-[#1f2a52] transition hover:bg-indigo-50">Envoyer SMS de retard</button>
+			<p class="mt-1 text-xs text-indigo-200">Prévenez les patients en attente de {doctorName} en un seul clic.</p>
+			<button
+				onclick={notifyDelay}
+				disabled={notifyBusy || !waiting.length || !selectedDoctorId}
+				class="mt-3 min-h-[44px] w-full rounded-lg bg-white px-3 text-sm font-semibold text-[#1f2a52] transition hover:bg-indigo-50 disabled:cursor-not-allowed disabled:opacity-60"
+			>
+				{notifyBusy ? 'Envoi…' : 'Envoyer SMS de retard'}
+			</button>
+			{#if notifyResult}
+				<p role="status" class="mt-2 text-xs text-indigo-100">{notifyResult}</p>
+			{/if}
 		</div>
 
 		<button onclick={logout} class="mt-2 flex min-h-[44px] items-center gap-3 rounded-lg px-3 text-sm font-medium text-slate-500 transition hover:bg-slate-50 hover:text-rose-600">
@@ -332,7 +393,7 @@
 				</div>
 			{:else}
 				<!-- Metric cards -->
-				<section class="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
+				<section id="apercu" class="grid scroll-mt-6 grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
 					<div class="rounded-2xl bg-[#1f2a52] p-5 text-white shadow-sm">
 						<p class="text-sm font-medium text-indigo-200">En Attente</p>
 						<p class="mt-2 text-4xl font-bold">{waiting.length}</p>
@@ -350,6 +411,12 @@
 						</div>
 						<p class="mt-2 text-4xl font-bold text-slate-800">~{estimatedDelay}<span class="ml-1 text-base font-medium text-slate-400">min</span></p>
 						<p class="mt-2 text-xs text-slate-400">retard estimé de la file</p>
+						{#if accuracy?.sample_size}
+							<p class="mt-1 text-xs text-slate-500" title="Écart entre l'heure annoncée à l'arrivée et l'heure réelle d'entrée, aujourd'hui">
+								Précision : <span class="font-semibold text-slate-700">±{Math.round(accuracy.mae_minutes ?? 0)} min</span>
+								· {accuracy.within_10_min_pct}% à ±10 min ({accuracy.sample_size} patient{accuracy.sample_size > 1 ? 's' : ''})
+							</p>
+						{/if}
 					</div>
 
 					<div class="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
@@ -372,7 +439,7 @@
 				</section>
 
 				<!-- Queue board -->
-				<section class="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+				<section id="file" class="scroll-mt-6 rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
 					<div class="mb-4 flex items-center justify-between">
 						<h2 class="text-base font-semibold text-slate-800">File d'attente</h2>
 						<span class="rounded-full bg-slate-100 px-3 py-1 text-xs font-medium text-slate-500">{doctorName}</span>
@@ -392,7 +459,15 @@
 										<div class="rounded-xl border border-slate-200 bg-white p-3 shadow-sm {row.status === 'completed' ? 'opacity-60' : ''}">
 											<div class="flex items-center justify-between">
 												<span class="font-mono text-xs text-slate-400">{rowTime(row)}</span>
-												<span class="rounded-full px-2 py-0.5 text-[10px] font-semibold {STATUS_BADGE[row.status] ?? 'bg-slate-100 text-slate-500'}">{STATUS_LABEL[row.status] ?? row.status}</span>
+												<span class="flex items-center gap-1">
+													{#if row.status === 'waiting' && row.alert_shift_minutes && row.alert_at}
+														<span
+															class="rounded-full px-2 py-0.5 text-[10px] font-semibold {row.alert_shift_minutes > 0 ? 'bg-amber-50 text-amber-700' : 'bg-emerald-50 text-emerald-700'}"
+															title="Patient prévenu à {hhmm(row.alert_at)} : passage {row.alert_shift_minutes > 0 ? 'retardé' : 'avancé'} de {Math.abs(row.alert_shift_minutes)} min"
+														>🔔 {row.alert_shift_minutes > 0 ? '+' : '−'}{Math.abs(row.alert_shift_minutes)} min</span>
+													{/if}
+													<span class="rounded-full px-2 py-0.5 text-[10px] font-semibold {STATUS_BADGE[row.status] ?? 'bg-slate-100 text-slate-500'}">{STATUS_LABEL[row.status] ?? row.status}</span>
+												</span>
 											</div>
 											<div class="mt-2 flex items-center gap-3">
 												<div class="flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-xs font-semibold text-white {avatarColor(row.patient_name)}">{initials(row.patient_name)}</div>
@@ -429,9 +504,11 @@
 </div>
 
 <!-- Walk-in / RDV modal -->
+<svelte:window onkeydown={(e) => showModal && e.key === 'Escape' && (showModal = false)} />
 {#if showModal}
-	<div class="fixed inset-0 z-50 flex items-end justify-center bg-black/40 p-4 sm:items-center" onclick={() => (showModal = false)} role="presentation">
-		<form onsubmit={submitWalkIn} onclick={(e) => e.stopPropagation()} class="w-full max-w-md rounded-2xl bg-white p-5 shadow-xl">
+	<!-- backdrop closes only on clicks that land on itself, so the form needs no click handler -->
+	<div class="fixed inset-0 z-50 flex items-end justify-center bg-black/40 p-4 sm:items-center" onclick={(e) => e.target === e.currentTarget && (showModal = false)} role="presentation">
+		<form onsubmit={submitWalkIn} class="w-full max-w-md rounded-2xl bg-white p-5 shadow-xl">
 			<h3 class="text-lg font-semibold">Nouveau patient</h3>
 			<p class="mt-0.5 text-xs text-slate-500">Walk-in ou rendez-vous programmé</p>
 
@@ -449,6 +526,14 @@
 						<label class="text-xs font-medium text-slate-600" for="wi-proc">Motif</label>
 						<input id="wi-proc" bind:value={form.procedure_type} placeholder="Consultation" class="mt-1 min-h-[44px] w-full rounded-lg border border-slate-300 px-3 text-sm focus:border-indigo-400 focus:outline-none focus:ring-2 focus:ring-indigo-100" />
 					</div>
+				</div>
+				<div>
+					<label class="text-xs font-medium text-slate-600" for="wi-cat">Type d'acte</label>
+					<select id="wi-cat" bind:value={form.procedure_category} class="mt-1 min-h-[44px] w-full rounded-lg border border-slate-300 bg-white px-3 text-sm focus:border-indigo-400 focus:outline-none focus:ring-2 focus:ring-indigo-100">
+						{#each CATEGORIES as c (c.value)}
+							<option value={c.value}>{c.label}</option>
+						{/each}
+					</select>
 				</div>
 				<label class="flex items-center gap-2 text-sm text-slate-700">
 					<input type="checkbox" bind:checked={form.is_scheduled} class="h-4 w-4 rounded border-slate-300" />

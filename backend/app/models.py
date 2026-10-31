@@ -15,8 +15,8 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import (
-    BigInteger, DateTime, Enum as SAEnum, ForeignKey, Integer, Numeric,
-    String, Text, UniqueConstraint, Uuid, func,
+    BigInteger, DateTime, Enum as SAEnum, ForeignKey, Index, Integer, Numeric,
+    String, Text, UniqueConstraint, Uuid, func, text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -40,6 +40,22 @@ class AppointmentStatus(str, enum.Enum):
     completed = "completed"
     no_show = "no_show"
     cancelled = "cancelled"
+
+
+class ProcedureCategory(str, enum.Enum):
+    routine = "routine"
+    extended = "extended"
+    procedure_minor = "procedure_minor"
+    procedure_complex = "procedure_complex"
+
+
+# expected chair time per category — drives the queue wait-time estimate
+PROCEDURE_MINUTES: dict[ProcedureCategory, int] = {
+    ProcedureCategory.routine: 15,
+    ProcedureCategory.extended: 20,
+    ProcedureCategory.procedure_minor: 30,
+    ProcedureCategory.procedure_complex: 45,
+}
 
 
 # --- Identity (we own auth now, so we own the users table) ------------------
@@ -96,8 +112,26 @@ class Patient(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+# One live appointment per doctor per start time. The booking API pre-checks, but two
+# requests can pass that check together — this index is the final word. Partial: a
+# cancelled / no-show appointment frees its slot.
+SLOT_UNIQUE_INDEX = "uq_appointments_doctor_slot_live"
+_LIVE_SLOT_SQL = "status IN ('scheduled', 'waiting', 'in_session', 'completed')"
+
+
+def is_slot_conflict(exc: Exception) -> bool:
+    """True if an IntegrityError came from SLOT_UNIQUE_INDEX (and not, say, a foreign key)."""
+    msg = str(getattr(exc, "orig", exc))
+    # Postgres names the index; SQLite (tests) lists the columns
+    return SLOT_UNIQUE_INDEX in msg or "appointments.doctor_member_id, appointments.scheduled_start" in msg
+
+
 class Appointment(Base):
     __tablename__ = "appointments"
+    __table_args__ = (
+        Index(SLOT_UNIQUE_INDEX, "doctor_member_id", "scheduled_start", unique=True,
+              postgresql_where=text(_LIVE_SLOT_SQL), sqlite_where=text(_LIVE_SLOT_SQL)),
+    )
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
     clinic_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("clinics.id", ondelete="CASCADE"), index=True)
     patient_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("patients.id", ondelete="RESTRICT"))
@@ -107,7 +141,23 @@ class Appointment(Base):
     scheduled_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     scheduled_duration_minutes: Mapped[int] = mapped_column(Integer, default=30)
     predicted_start: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))  # written by heuristic engine
-    source: Mapped[str] = mapped_column(String(16), default="walk_in", server_default="scheduled")  # 'walk_in' | 'scheduled' — for BI bookings-vs-walkins
+    # first prediction the patient was given (on joining the line); never overwritten —
+    # the accuracy feedback loop compares it with session_started_at
+    first_predicted_start: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # proactive alerts: ETA the patient was last told, and the latest shift we alerted them about
+    notified_start: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    alert_shift_minutes: Mapped[int | None] = mapped_column(Integer)  # > 0 later, < 0 earlier
+    alert_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # last staff broadcast shown on the patient's tracker (polled); the timestamp tells a new
+    # message from one already shown, even when the wording repeats
+    latest_message: Mapped[str | None] = mapped_column(Text)
+    latest_message_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # stored as VARCHAR (no PG enum type to migrate); NULL never written — default routine
+    procedure_category: Mapped[ProcedureCategory] = mapped_column(
+        SAEnum(ProcedureCategory, native_enum=False, length=24),
+        default=ProcedureCategory.routine, server_default=ProcedureCategory.routine.value,
+    )
+    source: Mapped[str] = mapped_column(String(16), default="walk_in", server_default="scheduled")  # 'walk_in' | 'scheduled' | 'online' — for BI bookings-vs-walkins
 
     status: Mapped[AppointmentStatus] = mapped_column(
         SAEnum(AppointmentStatus, name="appointment_status"),

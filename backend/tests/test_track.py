@@ -1,7 +1,10 @@
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 
-from app.models import Appointment, AppointmentStatus, Clinic, ClinicMember, ClinicRole, Patient, User
+from app.localtime import day_bounds, today as local_today
+from app.models import (
+    Appointment, AppointmentStatus, Clinic, ClinicMember, ClinicRole, Patient, ProcedureCategory, User,
+)
 from app.services.auth_service import AuthService
 
 
@@ -16,16 +19,16 @@ async def test_track_returns_queue_position_without_ticket(client, session):
     session.add_all([doctor, first, second])
     await session.flush()
 
-    today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    today = day_bounds(local_today())[0]   # clinic-local midnight, as UTC
     # seeded straight into 'waiting' — fixture setup, not a business transition
     appts = [
         Appointment(
             clinic_id=clinic.id, patient_id=p.id, doctor_member_id=doctor.id,
             scheduled_start=today + timedelta(minutes=10 * i),
             arrived_at=today + timedelta(minutes=10 * i),
-            status=AppointmentStatus.waiting,
+            status=AppointmentStatus.waiting, procedure_category=cat,
         )
-        for i, p in enumerate([first, second])
+        for i, (p, cat) in enumerate([(first, ProcedureCategory.procedure_minor), (second, None)])
     ]
     session.add_all(appts)
     await session.commit()
@@ -38,6 +41,13 @@ async def test_track_returns_queue_position_without_ticket(client, session):
     assert body["position"] == 2
     assert body["people_ahead"] == 1
     assert "ticket" not in body
+    assert body["doctor_id"] == str(doctor.id)          # lets a finished patient re-book the same doctor
+    # first in line is a minor procedure (30 min); second's category is unset -> stored as routine
+    assert 29 <= body["eta_minutes"] <= 30
+    assert appts[1].procedure_category is ProcedureCategory.routine
+    assert body["ai_source"] in ("gemini", "heuristic")
+    assert body["ai_message"]
+    assert body["delay_minutes"] >= 0
 
     r = await client.get(f"/api/v1/public/track/{uuid.uuid4()}")
     assert r.status_code == 404
