@@ -11,6 +11,8 @@ export default defineConfig({
 			'/auth': 'http://localhost:8000'
 		}
 	},
+	// preview = production: no Vite proxy, /api goes through src/routes/api/[...path] (BACKEND_URL)
+	preview: { proxy: {} },
 	plugins: [
 		tailwindcss(),
 		sveltekit({
