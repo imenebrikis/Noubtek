@@ -1,3 +1,4 @@
+Markdown
 # Noubtek (نوبةك)
 
 > **Eliminating waiting room friction for private healthcare practices in Algeria — one queue at a time.**
@@ -65,3 +66,24 @@ cp .env.example .env   # Update DATABASE_URL and JWT_SECRET
 $env:PYTHONPATH = "."
 alembic upgrade head
 uvicorn app.main:app --reload
+API Interactive Docs: http://localhost:8000/docs
+
+Run Backend Tests: pytest
+
+2. Frontend (SvelteKit)
+Bash
+cd frontend
+npm install
+cp .env.example .env   # Set PUBLIC_API_BASE_URL=http://localhost:8000
+npm run dev
+🗺️ Post-MVP Roadmap (Next 90 Days)
+Local Network Notifications: WhatsApp and SMS triggers formatted for Algerian mobile carriers (Mobilis, Djezzy, Ooredoo).
+
+Reception QR Check-ins: Self-check-in kiosk mode for patients arriving on-site.
+
+Multi-Specialty Polyclinic Portal: Multi-doctor dashboard switcher and department-level patient routing.
+
+Analytics & BI Suite: Reporting on peak bottleneck hours, practitioner delay averages, and lost revenue metrics.
+
+👤 Author
+Built by Imane — Lead Developer & Architect (Algeria).
