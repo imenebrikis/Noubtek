@@ -50,7 +50,7 @@ Noubtek is a B2B SaaS queue management engine that replaces chaotic waiting room
 - Node.js 18+
 - PostgreSQL database instance (or free [Neon.tech](https://neon.tech) project)
 
-### 1. Backend (FastAPI)
+ 1.backend
 ```bash
 cd backend
 python -m venv .venv
@@ -70,7 +70,7 @@ API Interactive Docs: http://localhost:8000/docs
 
 Run Backend Tests: pytest
 
-2. Frontend (SvelteKit)
+ 2. Frontend (SvelteKit)
 Bash
 cd frontend
 npm install
