@@ -7,8 +7,7 @@ export default defineConfig({
 	// dev proxy -> FastAPI, so the browser stays same-origin (no CORS config needed)
 	server: {
 		proxy: {
-			'/api': 'http://localhost:8000',
-			'/auth': 'http://localhost:8000'
+			'/api': 'http://localhost:8000' // every backend route (auth included) lives under /api
 		}
 	},
 	// preview = production: no Vite proxy, /api goes through src/routes/api/[...path] (BACKEND_URL)
